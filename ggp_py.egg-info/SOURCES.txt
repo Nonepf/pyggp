@@ -1,0 +1,16 @@
+README.md
+pyproject.toml
+ggp/player/base.py
+ggp/player/legal.py
+ggp/player/random.py
+ggp/player/statemachine.py
+ggp/protocol/messages.py
+ggp/protocol/parser.py
+ggp/server/http_server.py
+ggp_py.egg-info/PKG-INFO
+ggp_py.egg-info/SOURCES.txt
+ggp_py.egg-info/dependency_links.txt
+ggp_py.egg-info/requires.txt
+ggp_py.egg-info/top_level.txt
+tests/test_player_server.py
+tests/test_protocol.py

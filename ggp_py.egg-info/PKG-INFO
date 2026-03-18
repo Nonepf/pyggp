@@ -1,0 +1,832 @@
+Metadata-Version: 2.4
+Name: ggp-py
+Version: 0.1.0
+Summary: A General Game Playing (GGP) HTTP player framework for Python
+License: MIT
+Project-URL: Homepage, https://github.com/yourname/ggp-py
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+
+# ggp-py
+
+A Python framework for building **General Game Playing (GGP)** players that speak the Stanford HTTP competition protocol.
+
+> **General Game Players** are programs that can accept a formal description of an arbitrary game at runtime and play it effectively — without knowing the rules in advance.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+  - [Protocol Layer](#protocol-layer)
+  - [Player Framework](#player-framework)
+  - [HTTP Server](#http-server)
+- [Writing Your Own Player](#writing-your-own-player)
+  - [Implementing StateMachine](#implementing-statemachine)
+  - [Subclassing GGPPlayer](#subclassing-ggpplayer)
+  - [Using the Clock](#using-the-clock)
+- [Built-in Players](#built-in-players)
+- [Running the Server](#running-the-server)
+- [Testing](#testing)
+- [GDL Language Reference](#gdl-language-reference)
+  - [Syntax Basics](#syntax-basics)
+  - [Reserved Keywords](#reserved-keywords)
+  - [A Complete Example — Tic-Tac-Toe](#a-complete-example--tic-tac-toe)
+  - [Rules Deep-Dive](#rules-deep-dive)
+  - [GDL Constraints](#gdl-constraints)
+- [GGP HTTP Protocol Reference](#ggp-http-protocol-reference)
+- [Project Structure](#project-structure)
+
+---
+
+## Overview
+
+`ggp-py` handles the **infrastructure** of GGP so you can focus on the **intelligence**:
+
+| What ggp-py handles | What you implement |
+|---|---|
+| HTTP server & request routing | `StateMachine` (GDL reasoner / game engine) |
+| GCL message parsing | `GGPPlayer.select_move()` (search algorithm) |
+| Clock enforcement & timeout fallback | Game-specific heuristics |
+| Match lifecycle (start → play → stop) | Whatever you like |
+
+**Zero runtime dependencies.** Everything uses the Python standard library (`http.server`, `threading`, `dataclasses`, …).
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/yourname/ggp-py.git
+cd ggp-py
+pip install -e .           # editable install
+pip install -e ".[dev]"    # + pytest for tests
+```
+
+Requires **Python 3.10+**.
+
+---
+
+## Quick Start
+
+```python
+# my_player.py
+import random
+from ggp import GGPPlayer, GGPServer
+from ggp.player.base import Clock, MatchContext
+
+
+# 1. Implement your game engine (see "Implementing StateMachine" below).
+class MyStateMachine:
+    def get_roles(self): ...
+    def get_initial_state(self): ...
+    def get_legal_moves(self, state, role) -> list[str]: ...
+    def get_next_state(self, state, joint_move: dict) -> object: ...
+    def is_terminal(self, state) -> bool: ...
+    def get_goal(self, state, role) -> int: ...   # 0–100
+
+
+def my_factory(rules: str) -> MyStateMachine:
+    sm = MyStateMachine()
+    sm.load(rules)   # parse the GDL string
+    return sm
+
+
+# 2. Write your player.
+class MyPlayer(GGPPlayer):
+    def select_move(self, context: MatchContext, clock: Clock) -> str:
+        moves = self.sm.get_legal_moves(context.state, context.role)
+        return random.choice(moves)   # replace with your search
+
+
+# 3. Serve it.
+player = MyPlayer(state_machine_factory=my_factory)
+GGPServer(player, port=9147).start()
+```
+
+Point any GGP Game Manager at `http://your-host:9147/`.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       GGP Game Manager                      │
+│              (Stanford Gamemaster, ggp.org, …)              │
+└───────────────────────────┬─────────────────────────────────┘
+                            │  HTTP POST  (text/acl)
+                            │  (info) / (start …) / (play …) / …
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    ggp.server.GGPServer                     │
+│                                                             │
+│  • Binds HTTP socket                                        │
+│  • Parses GCL S-expressions  → GCLMessage objects           │
+│  • Spawns worker thread per start/play message              │
+│  • Enforces clock; uses fallback move on timeout            │
+└───────────────────────────┬─────────────────────────────────┘
+                            │  calls handler methods
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    ggp.player.GGPPlayer                     │
+│                                                             │
+│  on_info()    → "available"                                 │
+│  on_start()   → builds StateMachine, calls setup()          │
+│  on_play()    → advances state, calls select_move()   ◄─── │ YOU
+│  on_stop()    → calls teardown()                            │ IMPLEMENT
+│  on_abort()   → calls teardown()                            │ THIS
+└───────────────────────────┬─────────────────────────────────┘
+                            │  uses
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                StateMachineProtocol (your code)             │
+│                                                             │
+│  get_roles() / get_initial_state() / get_legal_moves() …    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Protocol Layer
+
+`ggp.protocol` handles parsing the GCL wire format:
+
+```python
+from ggp.protocol import parse_gcl_message
+
+msg = parse_gcl_message("(play match1 ((mark 1 1) noop))")
+print(msg)
+# PlayMessage(match_id='match1', moves=['mark(1, 1)', 'noop'])
+
+print(msg.is_first_move)   # False
+print(msg.moves[0])        # 'mark(1, 1)'
+```
+
+Message types: `InfoMessage`, `StartMessage`, `PlayMessage`, `StopMessage`, `AbortMessage`.
+
+### Player Framework
+
+`GGPPlayer` is the abstract base. Subclass it and implement `select_move`:
+
+```python
+class GGPPlayer(ABC):
+    # Framework calls these; you can override any of them:
+    def on_info(self)             -> str: ...   # default: "available"
+    def on_start(msg, clock)      -> str: ...   # default: build SM, call setup()
+    def on_play(msg, clock)       -> str: ...   # default: advance state, call select_move()
+    def on_stop(msg)              -> str: ...   # default: call teardown()
+    def on_abort(msg)             -> str: ...   # default: call teardown()
+
+    # Override these:
+    def select_move(ctx, clock)   -> str: ...   # REQUIRED
+    def setup(ctx, clock)         -> None: ...  # optional; called after SM is ready
+    def teardown(ctx, last_moves) -> None: ...  # optional; called on stop/abort
+```
+
+`MatchContext` carries everything you need inside `select_move`:
+
+```python
+context.match_id    # str  — identifies the ongoing match
+context.role        # str  — your role (e.g. "white")
+context.state       # Any  — current game state (as returned by your SM)
+context.step        # int  — number of play messages received so far
+context.playclock   # int  — seconds per move
+```
+
+### HTTP Server
+
+`GGPServer` is a thin wrapper around `http.server.HTTPServer`:
+
+```python
+server = GGPServer(
+    player,
+    host="0.0.0.0",    # listen on all interfaces
+    port=9147,          # GGP competition default
+    clock_buffer=0.2,   # seconds subtracted from each clock for safety
+)
+server.start()          # blocking; Ctrl-C to stop
+```
+
+For testing you can run it in a background thread:
+
+```python
+server.start_background()
+# ... your test code ...
+server.stop()
+```
+
+---
+
+## Writing Your Own Player
+
+### Implementing StateMachine
+
+The framework uses **structural subtyping** (PEP 544 Protocol). No inheritance is required — just implement these six methods:
+
+```python
+class MyStateMachine:
+
+    def get_roles(self) -> list[str]:
+        """Role names in GDL declaration order, e.g. ["white", "black"]."""
+
+    def get_initial_state(self):
+        """Return the initial game state (any object you like)."""
+
+    def get_legal_moves(self, state, role: str) -> list[str]:
+        """
+        All legal action strings for `role` in `state`.
+        GDL guarantees at least one move exists in every non-terminal state.
+        Returns an empty list only when the state is terminal.
+        """
+
+    def get_next_state(self, state, joint_move: dict[str, str]):
+        """
+        Apply joint_move and return the new state.
+        joint_move maps every role to its chosen action string.
+        Example: {"white": "mark(1,1)", "black": "noop"}
+        """
+
+    def is_terminal(self, state) -> bool:
+        """True if the game is over."""
+
+    def get_goal(self, state, role: str) -> int:
+        """Goal value 0–100 for `role` in `state`."""
+```
+
+Then wrap it in a factory:
+
+```python
+def my_factory(rules: str) -> MyStateMachine:
+    """Called once per match with the raw GDL string."""
+    sm = MyStateMachine()
+    sm.parse_gdl(rules)
+    return sm
+```
+
+### Subclassing GGPPlayer
+
+```python
+class SearchPlayer(GGPPlayer):
+
+    def setup(self, context, clock):
+        """
+        Called once after the SM is built, within the startclock budget.
+        Use for opening analysis, precomputation, etc.
+        """
+        self._opening_move = self._analyse(context, clock)
+
+    def select_move(self, context, clock):
+        """
+        Called once per play message. Must return an action string
+        before the clock expires.
+        """
+        if self._opening_move:
+            move, self._opening_move = self._opening_move, None
+            return move
+        return self._search(context, clock)
+
+    def _search(self, context, clock):
+        best = None
+        for depth in range(1, 100):
+            if clock.is_expired():
+                break
+            best = self._minimax(context.state, depth)
+        return best or self.sm.get_legal_moves(context.state, context.role)[0]
+
+    def teardown(self, context, last_moves):
+        """Called when the match ends. Save learned data, log results, etc."""
+        goal = self.sm.get_goal(context.state, context.role)
+        print(f"Match ended. My goal: {goal}")
+```
+
+### Using the Clock
+
+```python
+def select_move(self, context, clock):
+    best_move = self.sm.get_legal_moves(context.state, context.role)[0]
+
+    # Iterative deepening: go deeper until time runs out.
+    for depth in range(1, 1000):
+        if clock.is_expired():
+            break
+        candidate = self._search_to_depth(context.state, depth)
+        if candidate:
+            best_move = candidate
+
+    print(f"Searched with {clock.elapsed():.2f}s elapsed, {clock.remaining():.2f}s left.")
+    return best_move
+```
+
+The server subtracts `clock_buffer` (default 0.2 s) from each deadline to absorb network and Python overhead. You generally don't need to add your own buffer on top of this.
+
+---
+
+## Built-in Players
+
+Two reference players are included:
+
+### `LegalPlayer`
+
+Always picks the **first legal move**. Deterministic, zero search, immune to timeout.
+
+```python
+from ggp import LegalPlayer, GGPServer
+
+player = LegalPlayer(state_machine_factory=my_factory)
+GGPServer(player, port=9147).start()
+```
+
+Use for: integration testing, verifying your SM is wired up correctly.
+
+### `RandomPlayer`
+
+Picks a **uniformly random legal move** each turn.
+
+```python
+from ggp import RandomPlayer, GGPServer
+
+player = RandomPlayer(
+    state_machine_factory=my_factory,
+    seed=42,   # optional: reproducible play
+)
+GGPServer(player, port=9147).start()
+```
+
+Use for: stochastic baseline, offline self-play, smoke testing.
+
+---
+
+## Running the Server
+
+**Blocking (production)**:
+
+```bash
+python my_player.py    # calls GGPServer(player).start()
+```
+
+**Background (tests)**:
+
+```python
+server = GGPServer(player, port=9147)
+server.start_background()
+time.sleep(0.1)  # wait for socket to bind
+
+# ... send HTTP requests ...
+
+server.stop()
+```
+
+**curl smoke test**:
+
+```bash
+# Check the player is up:
+curl -X POST http://localhost:9147/ \
+     -H "Content-Type: text/acl" \
+     -d "(info)"
+# → available
+
+# Start a match:
+curl -X POST http://localhost:9147/ \
+     -H "Content-Type: text/acl" \
+     -d "(start m1 white ((role white)(role black)) 30 10)"
+# → ready
+
+# Request a move:
+curl -X POST http://localhost:9147/ \
+     -H "Content-Type: text/acl" \
+     -d "(play m1 nil)"
+# → <action>
+
+# End the match:
+curl -X POST http://localhost:9147/ \
+     -H "Content-Type: text/acl" \
+     -d "(stop m1 (noop noop))"
+# → done
+```
+
+---
+
+## Testing
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v
+```
+
+The test suite spins up a real HTTP server on port `19147` and exercises the full request/response cycle. Tests use a stub `StateMachine` (no GDL parser needed).
+
+---
+
+## GDL Language Reference
+
+**Game Description Language (GDL)** is the formal language GGP uses to describe games. It is a logic programming language (similar to Datalog/Prolog) with special reserved keywords for game-specific concepts.
+
+This section is a practical guide. For the full formal specification see the [Stanford GDL spec](http://ggp.stanford.edu/readings/gdl_spec.pdf).
+
+---
+
+### Syntax Basics
+
+GDL uses **prefix S-expression** (Lisp-style) syntax. All expressions are parenthesised lists:
+
+```
+(keyword arg1 arg2 ...)
+```
+
+**Atoms (constants)** begin with a lowercase letter or digit:
+
+```
+white   black   cell   1   2   3   noop   b   x   o
+```
+
+**Variables** begin with `?`:
+
+```
+?role   ?x   ?y   ?w   ?player
+```
+
+**Compound terms** (functors) are also S-expressions:
+
+```
+(cell 1 2 b)      ; cell(1, 2, b) in traditional notation
+(mark 1 1)        ; mark(1, 1)
+(control white)   ; control(white)
+```
+
+**Rules** use `<=` (read: "if"):
+
+```
+(<= head body1 body2 ...)
+```
+
+This means: `head` is true **if** `body1` and `body2` and … are all true.
+
+**Negation** uses `not`:
+
+```
+(not (true (control black)))   ; "control(black) is not true"
+```
+
+**Comments** (in some implementations):
+
+```
+; This is a comment
+```
+
+---
+
+### Reserved Keywords
+
+| Keyword | Arity | Meaning |
+|---|---|---|
+| `role` | 1 | Declares a player role |
+| `base` | 1 | Declares a base proposition (all possible state facts) |
+| `input` | 2 | Declares a feasible action for a role |
+| `init` | 1 | A proposition true in the initial state |
+| `true` | 1 | A proposition true in the **current** state (input relation) |
+| `does` | 2 | The action a role performs in the current step (input relation) |
+| `next` | 1 | A proposition true in the **next** state (output relation) |
+| `legal` | 2 | An action is legal for a role in the current state |
+| `goal` | 2 | The goal value (0–100) for a role in the current state |
+| `terminal` | 0 | The current state is terminal (game over) |
+| `distinct` | 2 | Built-in: two terms are not equal |
+
+**Input relations** (`true`, `does`) may only appear in rule bodies.  
+**Output relations** (`next`, `legal`, `goal`, `terminal`) are defined by the rules.
+
+---
+
+### A Complete Example — Tic-Tac-Toe
+
+Below is the full GDL description of Tic-Tac-Toe. Read it top-to-bottom.
+
+```lisp
+;;; ─── Roles ───────────────────────────────────────────────────────────────
+;;; Two players: white (plays x) and black (plays o).
+
+(role white)
+(role black)
+
+;;; ─── Base propositions ───────────────────────────────────────────────────
+;;; Declares every proposition that can ever be true in any state.
+;;; cell(row, col, mark): the cell at (row,col) contains mark (x, o, or b).
+;;; control(role): it is role's turn to move.
+
+(base (cell ?m ?n x))    ; for all rows ?m and columns ?n
+(base (cell ?m ?n o))
+(base (cell ?m ?n b))
+(base (control white))
+(base (control black))
+
+;;; ─── Inputs (feasible actions) ───────────────────────────────────────────
+;;; Every role can potentially mark any cell, or do nothing (noop).
+
+(input ?r (mark ?m ?n))  ; for all roles ?r, rows ?m, columns ?n
+(input ?r noop)
+
+;;; ─── Helper facts ─────────────────────────────────────────────────────────
+
+(index 1) (index 2) (index 3)
+
+;;; ─── Initial state ────────────────────────────────────────────────────────
+;;; All 9 cells are blank; white moves first.
+
+(<= (init (cell ?m ?n b)) (index ?m) (index ?n))
+(init (control white))
+
+;;; ─── Legality ─────────────────────────────────────────────────────────────
+;;; White may mark a blank cell when it has control.
+;;; Otherwise it must play noop.
+
+(<= (legal ?w (mark ?m ?n))
+    (true (cell ?m ?n b))
+    (true (control ?w)))
+
+(<= (legal white noop)
+    (true (control black)))
+
+(<= (legal black noop)
+    (true (control white)))
+
+;;; ─── Next state (transition rules) ───────────────────────────────────────
+;;; If white marks cell (m,n) and it was blank, it becomes x.
+
+(<= (next (cell ?m ?n x))
+    (does white (mark ?m ?n))
+    (true (cell ?m ?n b)))
+
+;;; If black marks cell (m,n) and it was blank, it becomes o.
+
+(<= (next (cell ?m ?n o))
+    (does black (mark ?m ?n))
+    (true (cell ?m ?n b)))
+
+;;; Any cell that already has a mark keeps it (frame axiom).
+
+(<= (next (cell ?m ?n ?w))
+    (true (cell ?m ?n ?w))
+    (distinct ?w b))
+
+;;; A blank cell stays blank if no one marks it (frame axiom).
+;;; (A cell that is overwritten is handled by the rules above.)
+
+(<= (next (cell ?m ?n b))
+    (does ?w (mark ?j ?k))
+    (true (cell ?m ?n b))
+    (distinct ?m ?j))
+
+(<= (next (cell ?m ?n b))
+    (does ?w (mark ?j ?k))
+    (true (cell ?m ?n b))
+    (distinct ?n ?k))
+
+;;; Control alternates each turn.
+
+(<= (next (control white)) (true (control black)))
+(<= (next (control black)) (true (control white)))
+
+;;; ─── Goal values ──────────────────────────────────────────────────────────
+;;; A player gets 100 if it has a line and the opponent does not.
+;;; Draw (no lines): 50. Opponent wins: 0.
+
+(<= (goal white 100) (line x) (not (line o)))
+(<= (goal white  50) (not (line x)) (not (line o)))
+(<= (goal white   0) (not (line x)) (line o))
+
+(<= (goal black 100) (not (line x)) (line o))
+(<= (goal black  50) (not (line x)) (not (line o)))
+(<= (goal black   0) (line x) (not (line o)))
+
+;;; ─── Terminal condition ───────────────────────────────────────────────────
+
+(<= terminal (line x))
+(<= terminal (line o))
+(<= terminal (not open))
+
+(<= open (true (cell ?m ?n b)))  ; game is open if any blank cell exists
+
+;;; ─── Supporting relations ─────────────────────────────────────────────────
+;;; A "line" means three of the same mark in a row, column, or diagonal.
+
+(<= (line ?w) (row ?m ?w))
+(<= (line ?w) (column ?n ?w))
+(<= (line ?w) (diagonal ?w))
+
+(<= (row ?m ?w)
+    (true (cell ?m 1 ?w))
+    (true (cell ?m 2 ?w))
+    (true (cell ?m 3 ?w)))
+
+(<= (column ?n ?w)
+    (true (cell 1 ?n ?w))
+    (true (cell 2 ?n ?w))
+    (true (cell 3 ?n ?w)))
+
+(<= (diagonal ?w)
+    (true (cell 1 1 ?w))
+    (true (cell 2 2 ?w))
+    (true (cell 3 3 ?w)))
+
+(<= (diagonal ?w)
+    (true (cell 1 3 ?w))
+    (true (cell 2 2 ?w))
+    (true (cell 3 1 ?w)))
+```
+
+---
+
+### Rules Deep-Dive
+
+#### How `true` and `does` work
+
+The game engine evaluates each GDL rule against two **input datasets**:
+
+- **`true(p)`** — the set of base propositions that hold in the *current* state.
+- **`does(role, action)`** — the joint move selected by all players this step.
+
+These are **inputs**: they may appear only in rule bodies, never in heads.
+
+The engine derives all **output** relations by forward chaining over the rules:
+
+```
+Inputs (true, does)  +  Rules  →  legal, next, goal, terminal
+```
+
+#### The frame problem
+
+GDL has no "default persistence". You must explicitly state that facts carry over.
+That is what the `(next (cell ?m ?n ?w)) :- (true (cell ?m ?n ?w)) & distinct(?w, b)` rules do — they say a marked cell stays marked. This is called a **frame axiom**.
+
+#### Stratified negation
+
+Negation (`not`) is allowed, but **never in a recursive cycle**. This ensures reasoning is always decidable.
+
+✅ OK — `not` on a base relation:
+```lisp
+(<= terminal (not open))
+```
+
+❌ Forbidden — `not` inside its own recursive definition:
+```lisp
+(<= (p ?x) (not (p ?x)))   ; illegal: p recursively negates itself
+```
+
+#### `distinct` is built-in
+
+`(distinct ?x ?y)` succeeds when `?x` and `?y` are not the same term. It cannot be defined with rules.
+
+```lisp
+(<= (next (cell ?m ?n b))
+    (does ?w (mark ?j ?k))
+    (true (cell ?m ?n b))
+    (distinct ?m ?j))       ; only keep blank if row index differs
+```
+
+#### Variables are universally quantified
+
+A rule like:
+
+```lisp
+(<= (legal ?w (mark ?m ?n))
+    (true (cell ?m ?n b))
+    (true (control ?w)))
+```
+
+means: **for every** `?w`, `?m`, `?n` — if the cell is blank and `?w` has control, then `?w` may mark it.
+
+---
+
+### GDL Constraints
+
+A valid GDL game description must be:
+
+| Property | Meaning |
+|---|---|
+| **Safe** | Every variable in a rule head or negated body also appears in a positive body literal |
+| **Stratified** | No negation appears in a recursive dependency cycle |
+| **Terminating** | All legal-move sequences eventually reach a terminal state |
+| **Playable** | Every role has at least one legal move in every non-terminal state |
+| **Weakly winnable** | For every role, there exists *some* joint sequence of actions that gives it a maximal goal value |
+
+Games used in GGP competitions are always **well-formed** (terminating + playable + weakly winnable).
+
+---
+
+## GGP HTTP Protocol Reference
+
+The Game Manager communicates with players via HTTP POST requests. All message bodies use the S-expression wire format with `Content-Type: text/acl`.
+
+### Messages (Game Manager → Player)
+
+#### `(info)`
+Check if the player is alive.
+
+**Response:** `available` (or `busy` if in a match and unavailable)
+
+---
+
+#### `(start <matchId> <role> <rules> <startclock> <playclock>)`
+
+Begin a new match.
+
+| Field | Type | Description |
+|---|---|---|
+| `matchId` | string | Unique match identifier |
+| `role` | atom | The role this player will assume |
+| `rules` | list | Complete GDL game description (S-expression list) |
+| `startclock` | integer | Seconds to prepare (build SM, do metagaming) |
+| `playclock` | integer | Seconds per move once play begins |
+
+**Response:** `ready`  
+Must reply within `startclock` seconds.
+
+---
+
+#### `(play <matchId> <moves>)`
+
+Request the player's next action.
+
+| Field | Type | Description |
+|---|---|---|
+| `matchId` | string | Identifies the ongoing match |
+| `moves` | list or `nil` | Joint move from the *previous* step, in role-declaration order. `nil` on the first step. |
+
+**Response:** an action string, e.g. `mark(1,1)` or `noop`  
+Must reply within `playclock` seconds. If the player does not reply in time, the Game Manager substitutes a random legal move.
+
+---
+
+#### `(stop <matchId> <moves>)`
+
+The match has reached a terminal state.
+
+**Response:** `done`
+
+---
+
+#### `(abort <matchId>)`
+
+The match is terminated abnormally (not necessarily at a terminal state).
+
+**Response:** `done`
+
+### Example Session
+
+```
+GM → Player:  (start m23 white ((role white)(role black)...) 30 10)
+Player → GM:  ready
+
+GM → Player:  (play m23 nil)
+Player → GM:  mark(1,1)
+
+GM → Player:  (play m23 ((mark 1 1) noop))
+Player → GM:  noop
+
+GM → Player:  (play m23 (noop (mark 2 2)))
+Player → GM:  mark(3,3)
+
+GM → Player:  (stop m23 ((mark 3 3) noop))
+Player → GM:  done
+```
+
+---
+
+## Project Structure
+
+```
+ggp-py/
+├── ggp/
+│   ├── __init__.py              Public API re-exports
+│   ├── protocol/
+│   │   ├── __init__.py
+│   │   ├── messages.py          GCLMessage dataclasses
+│   │   └── parser.py            S-expression tokeniser + GCL dispatcher
+│   ├── player/
+│   │   ├── __init__.py
+│   │   ├── statemachine.py      StateMachineProtocol (typing.Protocol)
+│   │   ├── base.py              GGPPlayer ABC + Clock + MatchContext
+│   │   ├── legal.py             LegalPlayer
+│   │   └── random.py            RandomPlayer
+│   └── server/
+│       ├── __init__.py
+│       └── http_server.py       GGPServer + _GGPRequestHandler
+├── tests/
+│   ├── test_protocol.py         Parser + message tests
+│   └── test_player_server.py    Player + HTTP integration tests
+├── examples/
+│   ├── custom_player.py         Write your own player from scratch
+│   └── builtin_players.py       LegalPlayer + RandomPlayer offline demo
+├── pyproject.toml
+└── README.md
+```
+
+---
+
+## License
+
+MIT
